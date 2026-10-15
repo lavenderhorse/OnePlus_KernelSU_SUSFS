@@ -1,0 +1,277 @@
+name: Build OnePlus 13 (6.6.118) with KernelSU Next
+
+# Dedicated single-device workflow.
+# Builds ONLY the OnePlus 13 running the android15-6.6.118 kernel
+# (OnePlusOSS branch oneplus/sm8750_b_16.0.0_oneplus_13) with KernelSU Next.
+# It reuses the shared ./.github/actions/build-kernel composite action, but it
+# does NOT generate a matrix from configs/, so no other devices are built.
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_branch_or_hash:
+        description: 'KernelSU-Next branch or commit hash'
+        required: true
+        type: string
+        default: 'dev'
+      susfs_branch_or_commit:
+        description: 'SusFS branch or commit hash (empty = auto gki-android15-6.6)'
+        required: false
+        type: string
+        default: ''
+      optimize_level:
+        description: 'Compiler optimization level'
+        required: true
+        type: choice
+        options: [O2, O3]
+        default: O2
+      clean_build:
+        description: 'Clean build (no ccache)'
+        type: boolean
+        default: false
+      debug:
+        description: 'Enable debug mode: dumping debug related artifacts and show some debug logs'
+        required: false
+        type: boolean
+        default: false
+      build_timestamp:
+        description: 'Custom kernel build timestamp for uname -a (e.g. "Tue Feb 10 10:01:02 UTC 2026"). Leave empty for current time.'
+        type: string
+        default: ''
+
+# Prevent two runs of this workflow from clobbering the shared ccache release tag.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  OP_CONFIG_PATH: configs/a16/OP13-6.6.118.json
+
+jobs:
+  build:
+    name: build (OP13-6.6.118, sun, wild/sm8750, KSUN)
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: 🧹 Emergency Disk Cleanup
+        uses: ./.github/actions/disk-cleanup
+
+      - name: Install Minimal Dependencies
+        run: |
+          set -euo pipefail
+          echo "::group::Install dependencies"
+          sudo apt-get -o Acquire::Retries=3 update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git curl ca-certificates build-essential clang lld flex bison \
+            libelf-dev libssl-dev libncurses-dev zlib1g-dev liblz4-tool \
+            libxml2-utils rsync unzip dwarves file python3 ccache jq bc dos2unix kmod libdw-dev elfutils pigz
+          sudo apt-get clean
+          echo "✅ Dependencies installed"
+          echo "::endgroup::"
+
+      - name: Download & Install custom ccache
+        run: |
+          set -uo pipefail
+          echo "::group::Install ccache"
+          # Download the custom ccache binary directly (single job, so no need to
+          # share it via artifact). Fall back to the apt ccache on failure.
+          url="https://raw.githubusercontent.com/WildKernels/kernel_patches/refs/heads/main/ccache/ccache-x86-64"
+          ok=0
+          for attempt in 1 2 3 4 5 6; do
+            if curl -LfsS --connect-timeout 30 --max-time 120 -H "User-Agent: Mozilla/5.0" "$url" -o /tmp/ccache && [ -s /tmp/ccache ]; then
+              ok=1; break
+            fi
+            echo "attempt $attempt failed (GitHub raw 504/throttle); backing off..."
+            sleep $(( attempt * 5 + RANDOM % 6 ))
+          done
+          if [ "$ok" = 1 ]; then
+            sudo cp -f /tmp/ccache /usr/bin/ccache
+            sudo chmod +x /usr/bin/ccache
+            echo "✅ installed custom ccache"
+          else
+            echo "::warning::custom ccache download failed; using apt ccache"
+          fi
+          rm -f /tmp/ccache
+          echo "[DEBUG] Ccache version : $(ccache --version | head -1)"
+          echo "::endgroup::"
+
+      - name: ♻️ Configure ccache (bounded)
+        run: |
+          echo "::group::Configure ccache environment"
+          set -euo pipefail
+          if command -v ccache >/dev/null 2>&1; then
+            CACHE_DIR="${{ github.workspace }}/.ccache"
+            CCACHE_LOG="${{ github.workspace }}/ccache.log"
+            mkdir -p "$CACHE_DIR"
+
+            SETTINGS=(
+              "CCACHE_DIR=$CACHE_DIR"
+              "CCACHE_MAXSIZE=12G"
+              "CCACHE_COMPILERCHECK=content"
+              "CCACHE_BASEDIR=${GITHUB_WORKSPACE}"
+              "CCACHE_NOHASHDIR=true"
+              "CCACHE_IGNOREOPTIONS=--sysroot*"
+              "CCACHE_COMPRESSION=true"
+              "CCACHE_COMPRESSION_LEVEL=3"
+              "CCACHE_DIRECT=true"
+              "CCACHE_FILE_CLONE=true"
+              "CCACHE_INODE_CACHE=true"
+              "CCACHE_IS_KERNEL_COMPILING=true"
+              "CCACHE_UMASK=002"
+              "CCACHE_LOGFILE=${CCACHE_LOG}"
+              "CCACHE_SLOPPINESS=file_macro,time_macros,include_file_mtime,include_file_ctime,pch_defines,system_headers,locale"
+            )
+
+            for setting in "${SETTINGS[@]}"; do
+              export "$setting"
+              echo "$setting" >> "$GITHUB_ENV"
+            done
+
+            if ccache --help 2>&1 | grep -q 'depend_mode'; then
+              export CCACHE_DEPEND=true
+              echo "CCACHE_DEPEND=true" >> "$GITHUB_ENV"
+            fi
+
+            echo "✅ ccache configured successfully"
+            ccache -p
+          else
+            echo "ccache not found, skipping configuration."
+          fi
+          echo "::endgroup::"
+
+      - name: 🧹 Prepare op_config_json (without KSU fields)
+        id: prepare_config
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f "$OP_CONFIG_PATH" ]; then
+            echo "::error::Config not found at $OP_CONFIG_PATH"
+            exit 1
+          fi
+          # No ksu_* fields exist in the config file, but strip them anyway to
+          # match the contract expected by the build-kernel action.
+          echo "config_json=$(jq -c 'del(.ksu_type, .ksu_hash, .ksu_resolved_hash)' "$OP_CONFIG_PATH")" >> "$GITHUB_OUTPUT"
+
+      - name: 🔨 Build Kernel
+        id: build
+        uses: ./.github/actions/build-kernel
+        with:
+          op_config_json: ${{ steps.prepare_config.outputs.config_json }}
+          ksu_type: KSUN
+          ksu_branch_or_hash: ${{ inputs.ksu_branch_or_hash }}
+          susfs_commit_hash_or_branch: ${{ inputs.susfs_branch_or_commit }}
+          optimize_level: ${{ inputs.optimize_level }}
+          build_timestamp: ${{ inputs.build_timestamp }}
+          clean: ${{ inputs.clean_build }}
+          debug: ${{ inputs.debug }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📊 Build statistics
+        id: build-stat
+        if: always()
+        run: |
+          echo "::group::Build Statistics"
+
+          echo "Device: OP13-6.6.118"
+          echo "OS Version: A16"
+          echo "Kernel: android15-6.6"
+          echo "Status: ${{ job.status }}"
+
+          if [ "${{ steps.build.outcome }}" = "success" ]; then
+            echo ""
+            echo "✅ Build completed successfully"
+            echo ""
+            echo "Outputs:"
+            echo "  - Kernel: ${{ steps.build.outputs.kernel_version }}"
+            echo "  - KSU Next: v${{ steps.build.outputs.ksu_version }}"
+            echo "  - SUSFS: ${{ steps.build.outputs.susfs_version }}"
+            echo "  - Build time: ${{ steps.build.outputs.build_time }}s"
+
+            if [ "${{ inputs.clean_build }}" != "true" ]; then
+              echo "  - ccache hit rate: ${{ steps.build.outputs.ccache_hit_rate }}"
+              echo "  - ccache direct rate: ${{ steps.build.outputs.ccache_direct_rate }}"
+            else
+              echo "  - ccache: disabled (clean build)"
+            fi
+
+            if [ -n "${{ steps.build.outputs.warnings }}" ]; then
+              echo "  - Warnings: ${{ steps.build.outputs.warnings }}"
+            fi
+          else
+            echo "❌ Build failed"
+          fi
+
+          echo "::endgroup::"
+
+      - name: 📝 Job summary
+        if: always()
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+
+          ### OP13-6.6.118 (A16) - ${{ job.status == 'success' && '✅ Success' || '❌ Failed' }}
+
+          **Kernel:** android15-6.6
+          EOF
+
+          if [ "${{ steps.build.outcome }}" = "success" ]; then
+            cat >> $GITHUB_STEP_SUMMARY << EOF
+          | Metric | Value |
+          |--------|-------|
+          | **Kernel** | ${{ steps.build.outputs.kernel_version }} |
+          | **KSU Next** | v${{ steps.build.outputs.ksu_version }} |
+          | **SUSFS** | ${{ steps.build.outputs.susfs_version }} |
+          | **Build Time** | ${{ steps.build.outputs.build_time }}s |
+          EOF
+
+            if [ "${{ inputs.clean_build }}" != "true" ]; then
+              cat >> $GITHUB_STEP_SUMMARY << EOF
+          | **ccache Hit Rate** | ${{ steps.build.outputs.ccache_hit_rate }} |
+          | **ccache Direct Rate** | ${{ steps.build.outputs.ccache_direct_rate }} |
+          EOF
+            fi
+
+            if [ -n "${{ steps.build.outputs.warnings }}" ]; then
+              echo "| **Warnings** | ${{ steps.build.outputs.warnings }} |" >> $GITHUB_STEP_SUMMARY
+            fi
+
+            cat >> $GITHUB_STEP_SUMMARY << EOF
+
+          **Image SHA256:** \`${{ steps.build.outputs.image_sha256 }}\`
+          **AnyKernel3 Zip SHA256:** \`${{ steps.build.outputs.zip_sha256 }}\`
+          EOF
+          fi
+
+      - name: 🧹 Final cleanup and space report
+        if: always()
+        run: |
+          echo "::group::Cleanup"
+
+          # Remove build artifacts but PRESERVE ccache
+          sudo rm -rf "$GITHUB_WORKSPACE/out" || true
+          sudo rm -rf "$GITHUB_WORKSPACE/build" || true
+          sudo rm -rf "$GITHUB_WORKSPACE/kernel/out" || true
+          sudo rm -rf "$GITHUB_WORKSPACE/.repo" || true
+          sudo rm -rf /tmp/* || true
+
+          # Show ccache stats (don't clear it!)
+          if command -v ccache >/dev/null 2>&1; then
+            echo ""
+            echo "📊 ccache statistics after build:"
+            ccache -s
+            echo ""
+            echo "💾 ccache preserved for next build"
+          fi
+
+          echo ""
+          echo "💽 Final disk usage:"
+          df -h /
+
+          echo "::endgroup::"
